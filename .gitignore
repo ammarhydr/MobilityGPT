@@ -1,0 +1,12 @@
+.ipynb_checkpoints/
+__pycache__/
+*.swp
+.env
+.pylintrc
+.DS_Store
+*_synthetic
+*-Taxi/*
+*.txt
+venv/
+*.egg-info/
+.vscode/
