@@ -1,393 +1,342 @@
-import geopandas as gpd
 import pandas as pd
-from scipy.spatial import distance
-import pickle
-from tqdm import tqdm
 import numpy as np
-from shapely.geometry import LineString, Point
-import osmnx as ox
-import geopy.distance
+import pickle
+import logging
+from tqdm import tqdm
+from pathlib import Path
+from typing import List, Dict, Tuple
 from collections import Counter
-import torch
+from scipy.spatial import distance
+import geopy.distance
+import networkx as nx
 
-crs = {'init': 'epsg:4326'} 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-
-def od_pair_to_adjacency_matrix(od_pair_list):
-    """
-    Converts an od pair to an adjacency matrix.
-
-    Args:
-        od_pair (torch.Tensor): A tensor of od pairs, where each pair is a two-dimensional tensor of the form [source, destination].
-
-    Returns:
-        torch.Tensor: An adjacency matrix
-    """
-
-    od_pair= torch.tensor(od_pair_list)
-    # Create a sparse adjacency matrix.
-    adjacency_matrix = torch.sparse_coo_tensor(od_pair.t(), torch.ones(od_pair.size(0)))
-
-    # Convert the sparse adjacency matrix to a dense adjacency matrix.
-    adjacency_matrix = adjacency_matrix.to_dense().numpy()
-
-    # Return the adjacency matrix.
-    return adjacency_matrix
-
-def get_radius(traj):
-    """
-    get the std of the distances of all points away from center as `gyration radius`
-    :param trajs:
-    :return:
-    """
-
-    xs = []
-    ys = []
-    for ind, geo in traj.iterrows():
-        coordinate = list(map(float, geo['coordinates'].replace('[', '').replace(']', '').split(',')))
-        ys.append(coordinate[0])
-        xs.append(coordinate[1])
-    xcenter, ycenter = np.mean(xs), np.mean(ys)
-    dxs = xs - xcenter
-    dys = ys - ycenter
-    rad = [dxs[i]**2 + dys[i]**2 for i in range(len(traj))]
+class TrajectoryEvaluator:
+    """Evaluate generated trajectories against ground truth."""
     
-    return np.mean(np.array(rad, dtype=float))
-    
-
-def arr_to_distribution(arr, min, max, bins):
-    """
-    convert an array to a probability distribution
-    :param arr: np.array, input array
-    :param min: float, minimum of converted value
-    :param max: float, maximum of converted value
-    :param bins: int, number of bins between min and max
-    :return: np.array, output distribution array
-    """
-    distribution, base = np.histogram(
-        arr, np.arange(
-            min, max, float(
-                max - min) / bins))
-    return distribution, base[:-1]
-
-def save_to_gdp(links_all, path, name):
-    
-    data = list(set(links_all))
-
-    link_counts = Counter(links_all)
-    
-    df_in=geo.loc[geo['geo_id'].isin(data)].reset_index(drop=True)
-    counts_df = pd.DataFrame(list(link_counts.items()), columns=['geo_id', 'counts'])
-    df = pd.merge(df_in, counts_df, on='geo_id', how='left')
-
-    coordinates = [list(map(float, c.replace('[', '').replace(']', '').split(','))) for c in df['coordinates'].tolist()]
-    
-    geometry=[]
-    for x in coordinates:
-        geometry.append(LineString([Point(pair) for pair in zip(x[::2], x[1::2])]))
-        # geometry.append(Point([x[-2], x[-1]]))
-    df['geometry'] = geometry
-    
-    df=df[['geo_id', 'length', 'counts', 'geometry']]
-    gdf = gpd.GeoDataFrame(df, geometry="geometry",  crs = crs)
-    
-    fdf = ox.project_gdf(gdf,to_latlong=True)
-    fdf.to_file(path+name+'.geojson',driver='GeoJSON')
-
-
-
-def calculate_gravity(trajs, dataset):
-    
-    file = open(dataset+'-Taxi/regions','rb')
-    regions, region_links, links_region = pickle.load(file)
-
-    regions_count=np.zeros((2, len(regions)))
-    for links in trajs:
-        for r in range(len(regions)):
-            if links[0] in region_links[r]:
-                regions_count[0][r]+=1
-            if links[-1] in region_links[r]:
-                regions_count[1][r]+=1
-                
-    regions_count=regions_count.sum(axis=0, keepdims=True)
-    
-    gravity=np.zeros((len(regions), len(regions)))
-    for r1 in range(len(regions)):
-        for r2 in range(len(regions)):
-            dist=geopy.distance.geodesic(regions.center.iloc[r1], regions.center.iloc[r2]).m
-            if dist!=0:
-                gravity[r1, r2]=regions_count[0, r1]*regions_count[0, r2]/(dist**2)
-    
-    gravity_traj = [] 
-    for links in trajs:
-        r_o = links_region[links[0]]
-        r_d = links_region[links[-1]]
-        gravity_traj.append(gravity[r_o, r_d])
+    def __init__(self, dataset: str = "SF"):
+        """Initialize evaluator."""
+        self.dataset = dataset
+        self.data_dir = Path(f'./{dataset}-Taxi')
+        self.work_dir = Path(f'./Trajs_{dataset}_synthetic/gpt-mobility')
+        self.crs = {'init': 'epsg:4326'}
         
-    return gravity_traj
-
-
-def plot_gravity_map(trajs, path, name, dataset):
-    
-    file = open(dataset+'-Taxi/regions','rb')
-    regions, region_links, links_region = pickle.load(file)
-
-    regions_count=np.zeros((2, len(regions)))
-    for links in trajs:
-        for r in range(len(regions)):
-            if links[0] in region_links[r]:
-                regions_count[0][r]+=1
-            if links[-1] in region_links[r]:
-                regions_count[1][r]+=1
-                
-    regions_count=regions_count.sum(axis=0, keepdims=True)
-    
-    gravity=np.zeros((len(regions), len(regions)))
-    for r1 in range(len(regions)):
-        for r2 in range(len(regions)):
-            dist=geopy.distance.geodesic(regions.center.iloc[r1], regions.center.iloc[r2]).m
-            if dist!=0:
-                gravity[r1, r2]=regions_count[0, r1]*regions_count[0, r2]/(dist**2)
-
-    regions1=regions[['region_id','geometry']]
-    regions1['gravity']=gravity.sum(axis=1)
-    
-    center=regions['center'].tolist()
-    
-    lat=[]
-    lon=[]
-    for x in center:
-        lat.append(((x[0])))
-        lon.append(((x[1])))
+    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarray, Dict]:
+        """Load required data files."""
+        # Load road network data
+        geo = pd.read_csv(self.data_dir / 'roadmap.geo')
+        rel = pd.read_csv(self.data_dir / 'roadmap.rel')
         
-    regions1['lat']=lat
-    regions1['lon']=lon
-    gdf = gpd.GeoDataFrame(regions1, geometry="geometry",  crs = crs)
-    gdf.to_file(path+name+'_gravity.geojson',driver='GeoJSON')
-    
-def query_error(links_test, links_synth, edges):
-
-    sample_edges = edges.sample(500).geo_id.values
-    links_test_commom = list(set(links_test).intersection(sample_edges))
-    links_synth_commom = list(set(links_synth).intersection(sample_edges))
-
-    links_sample=edges.loc[edges.geo_id.isin(links_test_commom)]        
-    links_sample_synth=edges.loc[edges.geo_id.isin(links_synth_commom)]       
-    all_osmids=list(set(links_test+links_synth))        
-    
-    s_b=0.01*(5000)
-
-    link_counts_test = Counter(links_test)
-    link_counts_synth = Counter(links_synth)
-   
-    # Average Query Error
-    qe_all=[]
-    for l_id in all_osmids:
-        link=links_sample[links_sample.geo_id.isin([l_id])]
-        link_synth=links_sample_synth[links_sample_synth.geo_id.isin([l_id])]
-        if len(link)==1 and len(link_synth)==1:
-            qe=abs(link_counts_test[link.geo_id.iloc[0]]-link_counts_synth[link_synth.geo_id.iloc[0]])/max(link_counts_test[link.geo_id.iloc[0]], s_b)
-            qe_all.append(qe)
-        elif len(link)==1 and len(link_synth)==0:
-            qe=abs(link_counts_test[link.geo_id.iloc[0]])/max(link_counts_test[link.geo_id.iloc[0]], s_b)
-            qe_all.append(qe)
-        elif len(link)==0 and len(link_synth)==1:
-            qe=(link_counts_synth[link_synth.geo_id.iloc[0]])/s_b
-            qe_all.append(qe)  
-    
-    return np.mean(qe_all)
-
-def get_popular_origin(trajs):
-    origins = [t[0] for t in trajs]
-    origin_counts = Counter(origins)
-    most_pop = max(origin_counts.values())
-    key = next((key for key, value in origin_counts.items() if value == most_pop), None)
-    return key
-
-
-def remove_edges(path):
-    
-    removed_path = []
-    
-    for i in range(len(path)):
-        if path[i] not in removed_path:
-            removed_path.append(path[i])
-        else:
-            while removed_path[-1]!=path[i]:
-                removed_path.pop()
-                
-    return removed_path
-
-def connectivity_check(links, link_pairs):
-    
-    conn=0
-    for o, d in zip(links, links[1:]):
-        if d in link_pairs[o]:
-            conn+=1
+        # Create graph and get connectivity
+        graph = nx.from_pandas_edgelist(rel, source='origin_id', target='destination_id')
+        adj_matrix = nx.adjacency_matrix(graph).todense()
+        
+        # Create connectivity dictionary
+        connectivity = {}
+        for i, row in enumerate(adj_matrix):
+            connectivity[i] = np.where(row == 1)[0].tolist()
             
-    av_connectivity = conn/(len(links)-1)
-    return av_connectivity
-
-dataset = 'Porto'
-    
-work_dir = './Trajs_'+dataset+'_synthetic/'
-geo=pd.read_csv(dataset+'-Taxi/roadmap.geo')
-
-
-rel=pd.read_csv(dataset+'-Taxi/roadmap.rel')    
-rel['combined'] = rel.apply(lambda x: list([x['origin_id'], x['destination_id']]),axis=1)
-od_list=rel['combined'].tolist()
-adj_matrix=od_pair_to_adjacency_matrix(od_list)
-
-connectivity={}
-for indx, row in tqdm(enumerate(adj_matrix)):
-    ones_indices = np.where(row == 1)[0]
-    connectivity[indx] = list(ones_indices)
-
-
-df_data=pd.read_csv(dataset+'-Taxi/'+dataset+'_Taxi_trajectory_test.csv')
-samples=df_data.sample(n=5000, random_state=1)
-
-samples.to_csv(dataset+'-Taxi/'+dataset+'_Taxi_trajectory_sample.csv')
-
-links_str=samples.rid_list.values.tolist()
-links_test = [list(map(int, traj.split(','))) for traj in links_str]
-links_test_4count = [e for traj in links_str for e in list(map(int, traj.split(',')))]
-links_test_all = list(set(links_test_4count))
-
-
-file = open(work_dir+'test_PPO_trajectories_1e-6_T0.99.txt', 'rb')
-links_synth = pickle.load(file)
-# links_synth = [remove_edges(l) for l in links_synth]
-links_synth_4count = [ e for traj in links_synth for e in traj]
-links_synth_all = list(set(links_synth_4count))
-
-save_to_gdp(links_test_4count, work_dir,'test_map')
-save_to_gdp(links_synth_4count, work_dir, 'MobilityGPT_map')
-#%%
-plot_gravity_map(links_test, work_dir, 'test', dataset)
-plot_gravity_map(links_synth, work_dir, 'synth', dataset)
-
-gravity_test = calculate_gravity(links_test, dataset)
-gravity_synth = calculate_gravity(links_synth, dataset)
-
-
-
-# # origin_id = get_popular_origin(links_test)
-# origin_id = 20
-
-# links_most_test = [l for l in links_test if l[0]==origin_id]
-# samples_test = random.sample(links_most_test, 10)
-# for i, sample in enumerate(samples_test):
-#     save_to_gdp(sample, 'samples/test_'+str(i))
-
-# links_most_synth = [l for l in links_synth if l[0]==origin_id]
-# samples_synth = random.sample(links_most_synth, 10)
-# for i, sample in enumerate(samples_synth):
-#     save_to_gdp(sample, 'samples/synth_'+str(i))
-
-
-
-
-av_qe = query_error(links_test_4count, links_synth_4count, geo)
-
-OD_synth=[]
-length_synth=[]
-
-OD_test=[]
-length_test=[]
-
-rad_test = []
-rad_synth = []
-
-per_test = []
-per_synth = []
-
-# conn_test = []
-conn_synth = []
-for i in tqdm(range(len(links_test))):
-    link_ids = links_synth[i]
-    if len(link_ids)>1:
-        link_synth = geo[geo['geo_id'].isin(link_ids)]
-        OD_synth.append(link_ids[0])
-        OD_synth.append(link_ids[-1])
-        length = link_synth.length.sum()
-        length_synth.append(length)
-        rad_synth.append(get_radius(link_synth))
-        per_synth.append(float(len(set(link_ids)))/len(link_ids))
-        conn_synth.append(connectivity_check(link_ids, connectivity))
+        return geo, rel, adj_matrix, connectivity
         
-
-        link_ids=links_test[i] 
-        link_test = geo[geo['geo_id'].isin(link_ids)]
-        OD_test.append(link_ids[0])
-        OD_test.append(link_ids[-1])
-        length = link_test.length.sum()
-        length_test.append(length)
-        rad_test.append(get_radius(link_test))
-        per_test.append(float(len(set(link_ids)))/len(link_ids))
-        # conn_test.append(connectivity_check(link_ids, connectivity))
-
-
-
-OD_synth_dist, _ = arr_to_distribution(OD_synth, min(OD_synth+OD_test), max(OD_synth+OD_test), 300)
-OD_test_dist, _ = arr_to_distribution(OD_test, min(OD_synth+OD_test), max(OD_synth+OD_test), 300)
-
-length_synth_dist, _ = arr_to_distribution(length_synth, min(length_synth+length_test), max(length_synth+length_test), 300)
-length_test_dist, _ = arr_to_distribution(length_test, min(length_synth+length_test), max(length_synth+length_test), 300)
-
-rad_synth_dist, _ = arr_to_distribution(rad_synth, min(rad_synth+rad_test), max(rad_synth+rad_test), 300)
-rad_test_dist, _ = arr_to_distribution(rad_test, min(rad_synth+rad_test), max(rad_synth+rad_test), 300)
-
-link_synth_dist, _ = arr_to_distribution(links_synth_all, min(links_synth_all+links_test_all), max(links_synth_all+links_test_all), 300)
-link_test_dist, _ = arr_to_distribution(links_test_all, min(links_synth_all+links_test_all), max(links_synth_all+links_test_all), 300)
-
-gravity_synth_dist, _ = arr_to_distribution(gravity_synth, min(gravity_synth+gravity_test), max(gravity_synth+gravity_test), 100)
-gravity_test_dist, _ = arr_to_distribution(gravity_test, min(gravity_synth+gravity_test), max(gravity_synth+gravity_test), 100)
-
-# conn_synth_dist, _ = arr_to_distribution(conn_synth, min(conn_synth+conn_test), max(conn_synth+conn_test), 300)
-# conn_test_dist, _ = arr_to_distribution(conn_test, min(conn_synth+conn_test), max(conn_synth+conn_test), 300)
-
-js_OD=distance.jensenshannon(OD_synth_dist, OD_test_dist)
-print('JS value for OD: ',js_OD)
-
-js_length=distance.jensenshannon(length_synth_dist, length_test_dist)
-print('JS value for length: ',js_length)
-
-js_rad=distance.jensenshannon(rad_synth_dist, rad_test_dist)
-print('JS value for radius: ',js_rad)
-
-js_link=distance.jensenshannon(link_synth_dist, link_test_dist)
-print('JS value for link distribution: ',js_link)
-
-js_gravity=distance.jensenshannon(gravity_synth_dist, gravity_test_dist)
-print('JS value for gravity: ',js_gravity)
-
-av_conn = len([c for c in conn_synth if c==1])/len(conn_synth)
-print('Average connectivity: ', av_conn)
-
-
-# links_commom = list(set(links_test_all).intersection(links_synth_all))
-percentage_of_coverage = len(set(links_synth_all))/len(geo)
-print('Normalized coverage area with respect to test set: ', percentage_of_coverage)
-
-
-print('Average query error: ',av_qe)
-# js_rad=distance.jensenshannon(per_synth_dist, per_test_dist)
-# print('JS value for repeatitions: ',js_rad)
+    def _get_radius(self, traj: pd.DataFrame) -> float:
+        """Calculate gyration radius of trajectory."""
+        xs, ys = [], []
+        for _, geo in traj.iterrows():
+            coordinate = list(map(float, geo['coordinates'].replace('[', '').replace(']', '').replace('(', '').replace(')', '').split(',')))
+            ys.append(coordinate[0])
+            xs.append(coordinate[1])
+            
+        if not xs or not ys:
+            return 0.0
+            
+        xcenter, ycenter = np.mean(xs), np.mean(ys)
+        rad = [(xs[i] - xcenter)**2 + (ys[i] - ycenter)**2 
+               for i in range(len(traj))]
+        return np.mean(rad)
     
-# OD_synth_count=[OD_synth.count(x) for x in set(OD_synth)]
-# OD_test_count=[OD_test.count(x) for x in set(OD_test)]
+    def _calculate_gravity(self, trajs: List[List[int]]) -> List[float]:
+        """Calculate gravity values for trajectories."""
+        # Load region data
+        with open(self.data_dir / 'regions', 'rb') as f:
+            regions, region_links, links_region = pickle.load(f)
+            
+        # Calculate region counts
+        regions_count = np.zeros((2, len(regions)))
+        for links in trajs:
+            for r in range(len(regions)):
+                if links[0] in region_links[r]:
+                    regions_count[0][r] += 1
+                if links[-1] in region_links[r]:
+                    regions_count[1][r] += 1
+                    
+        regions_count = regions_count.sum(axis=0, keepdims=True)
+        
+        # Calculate gravity matrix
+        gravity = np.zeros((len(regions), len(regions)))
+        for r1 in range(len(regions)):
+            for r2 in range(len(regions)):
+                dist = geopy.distance.geodesic(
+                    regions.center.iloc[r1], 
+                    regions.center.iloc[r2]
+                ).m
+                if dist != 0:
+                    gravity[r1, r2] = (regions_count[0, r1] * 
+                                     regions_count[0, r2] / (dist**2))
+        
+        # Calculate trajectory gravity values
+        gravity_values = []
+        for links in trajs:
+            r_o = links_region[links[0]]
+            r_d = links_region[links[-1]]
+            gravity_values.append(gravity[r_o, r_d])
+            
+        return gravity_values
+    
+    def _remove_cycles(self, path: List[int]) -> List[int]:
+        """Remove cycles from trajectory."""
+        removed_path = []
+        for i in range(len(path)):
+            if path[i] not in removed_path:
+                removed_path.append(path[i])
+            else:
+                while removed_path[-1] != path[i]:
+                    removed_path.pop()
+        return removed_path
+    
+    def _check_connectivity(self, links: List[int], 
+                          connectivity: Dict[int, List[int]]) -> float:
+        """Check connectivity of trajectory."""
+        conn = 0
+        for o, d in zip(links, links[1:]):
+            if d in connectivity[o]:
+                conn += 1
+        return conn / (len(links) - 1) if len(links) > 1 else 0
+    
+    def calculate_metrics(self, test_trajs: List[List[int]], 
+                        synth_trajs: List[List[int]],
+                        geo: pd.DataFrame,
+                        connectivity: Dict[int, List[int]]) -> Dict:
+        """Calculate evaluation metrics."""
+        metrics = {}
+        
+        # Flatten trajectories
+        test_links = [link for traj in test_trajs for link in traj]
+        synth_links = [link for traj in synth_trajs for link in traj]
+        
+        # Calculate basic distributions
+        metrics.update(self._calculate_distribution_metrics(
+            test_trajs, synth_trajs, test_links, synth_links))
+        
+        # Calculate trajectory-specific metrics
+        metrics.update(self._calculate_trajectory_metrics(
+            test_trajs, synth_trajs, geo, connectivity))
+        
+        # Calculate gravity metrics
+        metrics.update(self._calculate_gravity_metrics(test_trajs, synth_trajs))
+        
+        # Calculate query error
+        metrics['query_error'] = self._calculate_query_error(
+            test_trajs, synth_trajs, geo)
+        
+        return metrics
+    
+    def _calculate_distribution_metrics(self, test_trajs, synth_trajs, 
+                                     test_links, synth_links) -> Dict:
+        """Calculate distribution-based metrics."""
+        metrics = {}
+        
+        # OD distribution
+        od_test = [traj[0] for traj in test_trajs] + [traj[-1] for traj in test_trajs]
+        od_synth = [traj[0] for traj in synth_trajs] + [traj[-1] for traj in synth_trajs]
+        od_dist_test, _ = self._arr_to_distribution(od_test, 
+                                                  min(od_test + od_synth),
+                                                  max(od_test + od_synth), 300)
+        od_dist_synth, _ = self._arr_to_distribution(od_synth,
+                                                   min(od_test + od_synth),
+                                                   max(od_test + od_synth), 300)
+        metrics['js_od'] = distance.jensenshannon(od_dist_test, od_dist_synth)
+        
+        # Link distribution
+        link_dist_test, _ = self._arr_to_distribution(test_links,
+                                                    min(test_links + synth_links),
+                                                    max(test_links + synth_links), 300)
+        link_dist_synth, _ = self._arr_to_distribution(synth_links,
+                                                     min(test_links + synth_links),
+                                                     max(test_links + synth_links), 300)
+        metrics['js_link'] = distance.jensenshannon(link_dist_test, link_dist_synth)
+        
+        return metrics
+    
+    def _calculate_trajectory_metrics(self, test_trajs, synth_trajs, 
+                                   geo, connectivity) -> Dict:
+        """Calculate trajectory-specific metrics."""
+        metrics = {}
+        
+        # Length distribution
+        test_lengths = []
+        synth_lengths = []
+        test_radii = []
+        synth_radii = []
+        synth_connectivity = []
+        
+        for traj in test_trajs:
+            traj_df = geo[geo['geo_id'].isin(traj)]
+            test_lengths.append(traj_df['length'].sum())
+            test_radii.append(self._get_radius(traj_df))
+            
+        for traj in synth_trajs:
+            traj_df = geo[geo['geo_id'].isin(traj)]
+            synth_lengths.append(traj_df['length'].sum())
+            synth_radii.append(self._get_radius(traj_df))
+            synth_connectivity.append(self._check_connectivity(traj, connectivity))
+        
+        # Calculate distributions and metrics
+        length_dist_test, _ = self._arr_to_distribution(test_lengths,
+                                                      min(test_lengths + synth_lengths),
+                                                      max(test_lengths + synth_lengths), 300)
+        length_dist_synth, _ = self._arr_to_distribution(synth_lengths,
+                                                       min(test_lengths + synth_lengths),
+                                                       max(test_lengths + synth_lengths), 300)
+        metrics['js_length'] = distance.jensenshannon(length_dist_test, length_dist_synth)
+        
+        rad_dist_test, _ = self._arr_to_distribution(test_radii,
+                                                   min(test_radii + synth_radii),
+                                                   max(test_radii + synth_radii), 300)
+        rad_dist_synth, _ = self._arr_to_distribution(synth_radii,
+                                                    min(test_radii + synth_radii),
+                                                    max(test_radii + synth_radii), 300)
+        metrics['js_radius'] = distance.jensenshannon(rad_dist_test, rad_dist_synth)
+        
+        # Connectivity score
+        metrics['connectivity'] = np.mean([c for c in synth_connectivity if c == 1])
+        
+        return metrics
+    
+    def _calculate_gravity_metrics(self, test_trajs, synth_trajs) -> Dict:
+        """Calculate gravity-based metrics."""
+        metrics = {}
+        
+        gravity_test = self._calculate_gravity(test_trajs)
+        gravity_synth = self._calculate_gravity(synth_trajs)
+        
+        gravity_dist_test, _ = self._arr_to_distribution(gravity_test,
+                                                       min(gravity_test + gravity_synth),
+                                                       max(gravity_test + gravity_synth), 100)
+        gravity_dist_synth, _ = self._arr_to_distribution(gravity_synth,
+                                                        min(gravity_test + gravity_synth),
+                                                        max(gravity_test + gravity_synth), 100)
+        metrics['js_gravity'] = distance.jensenshannon(gravity_dist_test, gravity_dist_synth)
+        
+        return metrics
 
-# fig, ax = plt.subplots(figsize=(10,8))
-# ax.plot(OD_test_count, label='Raw data', linewidth=6, color='red')
-# ax.plot(OD_synth_count,'-', label='Synthetic data', linewidth=2, color='blue')
-# plt.grid(axis='y', alpha=0.75)
-# # legend = ax.legend(loc='upper right', fontsize='x-large')
-# legend = ax.legend(fontsize='15')
-# plt.xticks(fontsize=14)
-# plt.yticks( fontsize=14)
-# plt.xlabel('Links', fontsize=16)
-# plt.ylabel('Frequency', fontsize=16)
-# plt.title('OD link distribution with adjacency matrix')
-# plt.show()
+    def _arr_to_distribution(self, arr, min, max, bins):
+        """
+        convert an array to a probability distribution
+        :param arr: np.array, input array
+        :param min: float, minimum of converted value
+        :param max: float, maximum of converted value
+        :param bins: int, number of bins between min and max
+        :return: np.array, output distribution array
+        """
+        distribution, base = np.histogram(
+            arr, np.arange(
+                min, max, float(
+                    max - min) / bins))
+        return distribution, base[:-1]
+
+    def evaluate(self, test_file: str, synth_file: str):
+        """Main evaluation function."""
+        logger.info("Loading data...")
+        geo, rel, adj_matrix, connectivity = self.load_data()
+        
+        # Load trajectories
+        test_df = pd.read_csv(self.data_dir / test_file).sample(n=5000, random_state=1)
+        test_trajs = [list(map(int, traj.split(','))) 
+                     for traj in test_df.rid_list.values]
+        
+        with open(self.work_dir / synth_file, 'rb') as f:
+            synth_trajs = pickle.load(f)
+            
+        # Remove cycles from synthetic trajectories
+        synth_trajs = [self._remove_cycles(traj) for traj in synth_trajs]
+        
+        # Calculate metrics
+        logger.info("Calculating metrics...")
+        metrics = self.calculate_metrics(test_trajs, synth_trajs, geo, connectivity)    
+        
+        # Log results
+        for metric, value in metrics.items():
+            logger.info(f"{metric}: {value:.4f}")
+
+    def _calculate_query_error(self, test_trajs: List[List[int]], 
+                             synth_trajs: List[List[int]], 
+                             geo: pd.DataFrame) -> float:
+        """Calculate average query error between test and synthetic trajectories.
+        
+        Args:
+            test_trajs: List of test trajectories
+            synth_trajs: List of synthetic trajectories
+            geo: DataFrame containing road network data
+            
+        Returns:
+            Average query error
+        """
+        # Flatten trajectories
+        links_test = [link for traj in test_trajs for link in traj]
+        links_synth = [link for traj in synth_trajs for link in traj]
+        
+        # Sample edges and find common links
+        sample_edges = geo.sample(5000).geo_id.values
+        links_test_common = list(set(links_test).intersection(sample_edges))
+        links_synth_common = list(set(links_synth).intersection(sample_edges))
+        
+        # Filter links
+        links_sample = geo[geo.geo_id.isin(links_test_common)]
+        links_sample_synth = geo[geo.geo_id.isin(links_synth_common)]
+        
+        # Get all unique links
+        all_osmids = list(set(links_test + links_synth))
+        
+        # Set sensitivity bound
+        s_b = 0.01 * 5000
+        
+        # Calculate link counts
+        link_counts_test = Counter(links_test)
+        link_counts_synth = Counter(links_synth)
+        
+        # Calculate query errors
+        qe_all = []
+        for l_id in all_osmids:
+            link = links_sample[links_sample.geo_id.isin([l_id])]
+            link_synth = links_sample_synth[links_sample_synth.geo_id.isin([l_id])]
+            
+            if len(link) == 1 and len(link_synth) == 1:
+                # Both exist
+                qe = abs(link_counts_test[link.geo_id.iloc[0]] - 
+                        link_counts_synth[link_synth.geo_id.iloc[0]]) / \
+                    max(link_counts_test[link.geo_id.iloc[0]], s_b)
+                qe_all.append(qe)
+            elif len(link) == 1 and len(link_synth) == 0:
+                # Only in test
+                qe = abs(link_counts_test[link.geo_id.iloc[0]]) / \
+                    max(link_counts_test[link.geo_id.iloc[0]], s_b)
+                qe_all.append(qe)
+            elif len(link) == 0 and len(link_synth) == 1:
+                # Only in synthetic
+                qe = link_counts_synth[link_synth.geo_id.iloc[0]] / s_b
+                qe_all.append(qe)
+        
+        return np.mean(qe_all)
+
+def main():
+    """Main entry point."""
+    evaluator = TrajectoryEvaluator(dataset="SF")
+    evaluator.evaluate(
+        test_file="SF_Taxi_trajectory_test.csv",
+        synth_file="test_trajectories.txt"
+    )
+
+if __name__ == "__main__":
+    main()
