@@ -1,10 +1,15 @@
 # MobilityGPT
+  
+![MobilityGPT Architecture](mobilitygpt.png)
 
-A road-segment-level decoder-only (GPT) model for generating and predicting mobility trajectories.
+**MobilityGPT** is a state-of-the-art model designed for **human mobility modeling**. Built as a **decoder-only GPT model**, it excels at generating mobility trajectories with high precision. By integrating **transformer architecture** with **spatial awareness**, MobilityGPT delivers superior trajectory predictions, making it a powerful tool for understanding and forecasting human movement patterns.
 
-## Overview
+## Key Innovations
+We introduce a **novel approach** to construct a **trajectory-aware preference dataset** for fine-tuning MobilityGPT with reinforcement learning, enabling the model to self-improve without the need for human labeling. This approach combines:
+- Established fine-tuning strategies
+- A new preference feedback dataset
 
-MobilityGPT learns to generate realistic mobility trajectories by training on road-segment-level movement data. The model combines transformer architecture with spatial awareness to generate high-quality trajectory predictions.
+By leveraging **self-supervised learning**, MobilityGPT minimizes human intervention, addressing scalability and bias challenges while continuously improving its performance.
 
 ### Key Features
 - Road network awareness through adjacency matrices
@@ -28,11 +33,10 @@ Your dataset directory (e.g., `SF-Taxi/`) should contain:
 
 1. Create and activate a new virtual environment:
 ```bash
-# Using venv (recommended)
 python -m venv mobilitygpt
-source mobilitygpt/bin/activate  # On Unix/macOS
+source mobilitygpt/bin/activate 
 
-pip install -e . # this will install the dependencies and the package
+pip install -e .
 ```
 
 ## Dataset
